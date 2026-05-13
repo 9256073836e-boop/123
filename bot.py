@@ -6,7 +6,7 @@ import aiohttp
 from datetime import datetime
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, BotCommandScopeDefault
 from openai import AsyncOpenAI
 
 # === ПЕРЕМЕННЫЕ ОКРУЖЕНИЯ ===
@@ -33,11 +33,10 @@ SHARED_DIR = os.environ.get('SHARED_DIR', '/app/shared')
 os.makedirs(SHARED_DIR, exist_ok=True)
 DB_PATH = os.path.join(SHARED_DIR, 'bot_data.db')
 
-# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ (таблицы для статистики и истории) ===
+# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ===
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Таблица пользователей
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             user_id INTEGER PRIMARY KEY,
@@ -45,7 +44,6 @@ def init_db():
             last_active TIMESTAMP
         )
     ''')
-    # Таблица сообщений (статистика)
     c.execute('''
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,7 +52,6 @@ def init_db():
             timestamp TIMESTAMP
         )
     ''')
-    # Таблица истории диалогов
     c.execute('''
         CREATE TABLE IF NOT EXISTS chat_history (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -112,7 +109,6 @@ def get_history(user_id: int, limit: int = 10):
     ''', (user_id, limit))
     rows = c.fetchall()
     conn.close()
-    # возвращаем в хронологическом порядке (от старых к новым)
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 def add_to_history(user_id: int, role: str, content: str):
@@ -149,6 +145,17 @@ async def get_openrouter_balance():
         except Exception as e:
             logger.error(f"Ошибка запроса баланса: {e}")
             return None
+
+# === НАСТРОЙКА КОМАНДНОГО МЕНЮ (программно) ===
+async def set_commands():
+    commands = [
+        BotCommand(command="start", description="🚀 Главное меню и приветствие"),
+        BotCommand(command="help", description="❓ Справка о командах"),
+        BotCommand(command="reset", description="🧹 Очистить историю диалога"),
+        BotCommand(command="stats", description="📊 Статистика бота (админ)"),
+    ]
+    await bot.set_my_commands(commands, scope=BotCommandScopeDefault())
+    logger.info("Команды установлены")
 
 # === ОБРАБОТЧИКИ ===
 @dp.message(Command("start"))
@@ -208,14 +215,10 @@ async def chat_handler(message: types.Message):
     user_id = message.from_user.id
     user_text = message.text
 
-    # Обновляем статистику
     update_user_activity(user_id)
     save_message(user_id, user_text)
-
-    # Сохраняем сообщение пользователя в историю
     add_to_history(user_id, "user", user_text)
 
-    # Получаем последние 10 сообщений из истории
     context = get_history(user_id, 10)
 
     messages_for_api = [
@@ -232,7 +235,6 @@ async def chat_handler(message: types.Message):
             temperature=0.7,
         )
         answer = response.choices[0].message.content
-        # Сохраняем ответ бота в историю
         add_to_history(user_id, "assistant", answer)
         await message.answer(answer)
     except Exception as e:
@@ -240,6 +242,7 @@ async def chat_handler(message: types.Message):
         await message.answer("⚠️ Ошибка при обращении к ИИ. Попробуйте позже.")
 
 async def main():
+    await set_commands()   # Устанавливаем команды при запуске
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
