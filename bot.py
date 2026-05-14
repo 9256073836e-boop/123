@@ -147,118 +147,52 @@ async def get_openrouter_balance():
             logger.error(f"Ошибка запроса баланса: {e}")
             return None
 
-# ========== ПОГОДА через Open-Meteo (геокодинг произвольных мест) ==========
-async def get_coordinates(location_query: str):
-    """
-    Получает широту и долготу для любого географического названия (город, регион, страна, район, аэропорт).
-    Использует Open-Meteo Geocoding API.
-    """
-    url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {
-        "name": location_query,
-        "count": 1,
-        "language": "ru",
-        "format": "json"
-    }
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if data.get("results"):
-                        result = data["results"][0]
-                        return result["latitude"], result["longitude"]
-                    else:
-                        return None, None
-                else:
-                    return None, None
-        except Exception as e:
-            logger.error(f"Ошибка геокодинга: {e}")
-            return None, None
-
-async def get_weather_by_coords(lat: float, lon: float, location_name: str) -> str:
-    """Запрашивает текущую погоду по координатам через Open-Meteo Forecast API."""
-    url = "https://api.open-meteo.com/v1/forecast"
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "current": "temperature_2m,apparent_temperature,wind_speed_10m,relative_humidity_2m,weather_code",
-        "wind_speed_unit": "ms",
-        "timezone": "Europe/Moscow"
-    }
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    current = data.get("current", {})
-                    temp = current.get("temperature_2m", "N/A")
-                    feels_like = current.get("apparent_temperature", "N/A")
-                    humidity = current.get("relative_humidity_2m", "N/A")
-                    wind_speed = current.get("wind_speed_10m", "N/A")
-                    weather_code = current.get("weather_code", 0)
-                    weather_map = {
-                        0: "☀️ Ясно", 1: "🌤️ В основном ясно", 2: "⛅ Переменная облачность",
-                        3: "☁️ Пасмурно", 45: "🌫️ Туман", 48: "🌫️ Туман (иней)",
-                        51: "🌦️ Морось", 53: "🌦️ Морось", 55: "🌦️ Морось",
-                        61: "🌧️ Дождь", 63: "🌧️ Дождь", 65: "🌧️ Дождь",
-                        71: "❄️ Снегопад", 73: "❄️ Снегопад", 75: "❄️ Снегопад",
-                        80: "🌦️ Ливень", 81: "🌦️ Ливень", 82: "🌦️ Ливень",
-                    }
-                    weather_desc = weather_map.get(weather_code, "🌥️ Облачно")
-                    return (f"🌍 Погода в местоположении *{location_name}*:\n"
-                            f"🌡️ Температура: *{temp}°C* (ощущается как {feels_like}°C)\n"
-                            f"💧 Влажность: {humidity}%\n"
-                            f"💨 Ветер: {wind_speed} м/с\n"
-                            f"☁️ {weather_desc}")
-                else:
-                    return f"⚠️ Не удалось получить погоду для '{location_name}'."
-        except Exception as e:
-            logger.error(f"Open-Meteo forecast error: {e}")
-            return "⚠️ Ошибка при запросе погоды."
-
+# ========== ПОГОДА через wttr.in ==========
 async def get_weather(location_query: str) -> str:
-    """Главная функция получения погоды по произвольному текстовому запросу (геокодинг + погода)."""
-    lat, lon = await get_coordinates(location_query)
-    if lat is None or lon is None:
-        return f"❌ Не удалось найти местоположение '{location_query}'. Проверьте название."
-    return await get_weather_by_coords(lat, lon, location_query)
+    """Возвращает погоду для города, региона, страны через wttr.in"""
+    location = location_query.strip()
+    # wttr.in понимает русские названия, но для надёжности иногда лучше транслит.
+    # Оставляем как есть — сервис сам разберётся.
+    url = f"https://wttr.in/{location}?format=%t:+%C&lang=ru"
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, timeout=10) as resp:
+                if resp.status == 200:
+                    text = await resp.text()
+                    text = text.strip()
+                    # Если сервис не распознал местоположение, вернёт "Unknown location"
+                    if text and not text.startswith("Unknown"):
+                        return f"🌍 Погода в *{location}*: {text}"
+                    else:
+                        return f"❌ Не удалось определить погоду для '{location}'. Попробуйте другое название."
+                else:
+                    return f"⚠️ Сервис погоды вернул ошибку {resp.status}."
+        except asyncio.TimeoutError:
+            return "⏰ Превышено время ожидания ответа от сервиса погоды."
+        except Exception as e:
+            logger.error(f"wttr.in error: {e}")
+            return f"⚠️ Ошибка при запросе погоды: {e}"
 
-# === ИЗВЛЕЧЕНИЕ МЕСТОПОЛОЖЕНИЯ ИЗ ЗАПРОСА О ПОГОДЕ (естественный язык) ===
+# === ИЗВЛЕЧЕНИЕ МЕСТОПОЛОЖЕНИЯ ИЗ ЗАПРОСА О ПОГОДЕ ===
 def extract_location_from_weather_query(text: str) -> str | None:
-    """
-    Извлекает название местоположения из сообщения о погоде.
-    Обрабатывает опечатки (например, 'москвпе' -> 'Москва').
-    """
     text_lower = text.lower()
-    
-    # Таблица распространённых опечаток и сокращений
-    typos = {
-        'москвпе': 'Москва', 'спб': 'Санкт-Петербург', 'питер': 'Санкт-Петербург',
-        'ростов': 'Ростов-на-Дону', 'нск': 'Новосибирск', 'ебург': 'Екатеринбург',
-        'нью-йорк': 'Нью-Йорк', 'вашингтон': 'Вашингтон', 'лондон': 'Лондон',
-        'париж': 'Париж', 'берлин': 'Берлин', 'рим': 'Рим', 'милан': 'Милан',
-    }
-    for wrong, correct in typos.items():
-        if wrong in text_lower:
-            return correct
-    
-    # Паттерны для извлечения местоположения после ключевых слов
+    # Паттерны для извлечения места после слов-маркеров
     patterns = [
-        r'погод[ауе]?\s+в\s+(.+?)(?:[.!?]|$)',
-        r'температур[ауе]?\s+в\s+(.+?)(?:[.!?]|$)',
-        r'weather\s+in\s+(.+?)(?:[.!?]|$)',
-        r'прогноз\s+погод[ы]?\s+в\s+(.+?)(?:[.!?]|$)',
-        r'сколько\s+градусов\s+в\s+(.+?)(?:[.!?]|$)',
-        r'какая\s+погода\s+в\s+(.+?)(?:[.!?]|$)',
-        r'что\s+с\s+погодой\s+в\s+(.+?)(?:[.!?]|$)',
-        r'погод[ауе]?\s+(.+?)(?:[.!?]|$)',          # "погода Калифорния"
+        r'погод[ауе]?\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
+        r'температур[ауе]?\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
+        r'weather\s+in\s+([a-z\s\-]+?)(?:[.!?]|$)',
+        r'прогноз\s+погод[ы]?\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
+        r'сколько\s+градусов\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
+        r'какая\s+погода\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
+        r'что\s+с\s+погодой\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
+        r'погод[ауе]?\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
     ]
     for pattern in patterns:
         match = re.search(pattern, text_lower)
         if match:
             location = match.group(1).strip()
             if location:
+                # Возвращаем с заглавной буквы
                 return location.capitalize()
     return None
 
@@ -286,7 +220,7 @@ async def set_main_menu(bot: Bot):
         BotCommand(command="/reset", description="Очистить историю диалога"),
         BotCommand(command="/stats", description="Статистика бота (только админ)"),
         BotCommand(command="/time", description="Текущее время и дата"),
-        BotCommand(command="/weather", description="Погода в месте (например, /weather Калифорния)"),
+        BotCommand(command="/weather", description="Погода в месте (город, регион, страна)"),
     ]
     await bot.set_my_commands(main_menu_commands)
 
@@ -305,7 +239,7 @@ async def start_cmd(message: types.Message):
         "У меня есть память о диалоге. /reset – очистить историю.\n"
         "Администратор может использовать /stats.\n"
         "Текущее время и дату можно узнать по команде /time.\n"
-        "Погоду в любом месте (город, регион, страна, район) можно узнать по команде /weather или спросить в чате, например 'какая погода в Калифорнии'.",
+        "Погоду в любом месте (город, регион, страна) можно узнать по команде /weather или спросить в чате, например 'какая погода в Калифорнии'.",
         reply_markup=keyboard
     )
 
@@ -364,10 +298,10 @@ async def help_cmd(message: types.Message):
         "/help – Эта справка\n"
         "/reset – Очистить историю диалога\n"
         "/time – Текущее время и дата\n"
-        "/weather <место> – Погода сейчас (город, регион, страна, район и т.п.)\n\n"
+        "/weather <место> – Погода сейчас (город, регион, страна)\n\n"
         "Примеры запросов:\n"
         "– Какая погода в Калифорнии?\n"
-        "– Температура в районе Лефортово\n"
+        "– Температура в Москве\n"
         "– Посоветуй недорогой отель в Сочи у моря.\n"
         "– Что посмотреть в Питере за 3 дня?\n\n"
         "Администратор: /stats"
