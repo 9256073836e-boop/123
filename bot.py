@@ -14,6 +14,7 @@ from openai import AsyncOpenAI
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
+TRAVELPAYOUTS_TOKEN = os.getenv("TRAVELPAYOUTS_TOKEN", "")  # опционально
 
 if not BOT_TOKEN or not OPENROUTER_API_KEY or not ADMIN_ID:
     raise ValueError("Не заданы BOT_TOKEN, OPENROUTER_API_KEY или ADMIN_ID")
@@ -60,6 +61,16 @@ def init_db():
             role TEXT,
             content TEXT,
             timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    # Таблица для статистики отелей (если понадобится)
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS hotel_stats (
+            hotel_id TEXT PRIMARY KEY,
+            hotel_name TEXT,
+            times_shown INTEGER DEFAULT 0,
+            times_chosen INTEGER DEFAULT 0,
+            last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
     conn.commit()
@@ -147,9 +158,8 @@ async def get_openrouter_balance():
             logger.error(f"Ошибка запроса баланса: {e}")
             return None
 
-# ========== ПОГОДА через wttr.in ==========
-async def get_weather(location_query: str) -> str:
-    location = location_query.strip()
+# === ПОГОДА через wttr.in ===
+async def get_weather(location: str) -> str:
     url = f"https://wttr.in/{location}?format=%t:+%C&lang=ru"
     async with aiohttp.ClientSession() as session:
         try:
@@ -160,14 +170,12 @@ async def get_weather(location_query: str) -> str:
                     if text and not text.startswith("Unknown"):
                         return f"🌍 Погода в *{location}*: {text}"
                     else:
-                        return f"❌ Не удалось определить погоду для '{location}'. Попробуйте другое название."
+                        return f"❌ Не удалось найти '{location}'"
                 else:
-                    return f"⚠️ Сервис погоды вернул ошибку {resp.status}."
-        except asyncio.TimeoutError:
-            return "⏰ Превышено время ожидания ответа от сервиса погоды."
+                    return f"⚠️ Ошибка {resp.status}"
         except Exception as e:
             logger.error(f"wttr.in error: {e}")
-            return f"⚠️ Ошибка при запросе погоды: {e}"
+            return "⚠️ Ошибка запроса погоды"
 
 def extract_location_from_weather_query(text: str) -> str | None:
     text_lower = text.lower()
@@ -175,21 +183,18 @@ def extract_location_from_weather_query(text: str) -> str | None:
         r'погод[ауе]?\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
         r'температур[ауе]?\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
         r'weather\s+in\s+([a-z\s\-]+?)(?:[.!?]|$)',
-        r'прогноз\s+погод[ы]?\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
-        r'сколько\s+градусов\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
         r'какая\s+погода\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
-        r'что\s+с\s+погодой\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
-        r'погод[ауе]?\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
+        r'сколько\s+градусов\s+в\s+([а-яёa-z\s\-]+?)(?:[.!?]|$)',
     ]
     for pattern in patterns:
-        match = re.search(pattern, text_lower)
-        if match:
-            location = match.group(1).strip()
-            if location:
-                return location.capitalize()
+        m = re.search(pattern, text_lower)
+        if m:
+            loc = m.group(1).strip()
+            if loc:
+                return loc.capitalize()
     return None
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ДАТЫ/ВРЕМЕНИ ===
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def get_current_datetime_str():
     now = datetime.utcnow() + timedelta(hours=3)  # МСК
     date_str = now.strftime("%d.%m.%Y")
@@ -205,99 +210,104 @@ def get_current_datetime_str():
         season = "зима"
     return date_str, time_str, season
 
+# === ФУНКЦИЯ АВТОИСПРАВЛЕНИЯ ОПЕЧАТОК ===
+def fix_typos(text: str) -> str:
+    """Исправляет типичные орфографические ошибки в ответах бота."""
+    replacements = {
+        "Стамбукву": "Стамбул",
+        "Стамбулбул": "Стамбул",
+        "Стамбуква": "Стамбул",
+        "Москвпе": "Москва",
+        "Москвеы": "Москве",
+        "Питерб": "Питер",
+        "Египета": "Египет",
+        "Туцрция": "Турция",
+        "Анталиья": "Анталья",
+        "Сочии": "Сочи",
+        "Казаньь": "Казань",
+    }
+    for wrong, correct in replacements.items():
+        text = text.replace(wrong, correct)
+    return text
+
 # === НАСТРОЙКА МЕНЮ КОМАНД ===
 async def set_main_menu(bot: Bot):
-    main_menu_commands = [
+    commands = [
         BotCommand(command="/start", description="Главное меню"),
-        BotCommand(command="/help", description="Справка о командах"),
+        BotCommand(command="/help", description="Справка"),
         BotCommand(command="/reset", description="Очистить историю диалога"),
-        BotCommand(command="/stats", description="Статистика бота (только админ)"),
+        BotCommand(command="/stats", description="Статистика (админ)"),
         BotCommand(command="/time", description="Текущее время и дата"),
-        BotCommand(command="/weather", description="Погода в месте (город, регион, страна)"),
+        BotCommand(command="/weather", description="Погода в городе (например, /weather Москва)"),
     ]
-    await bot.set_my_commands(main_menu_commands)
+    await bot.set_my_commands(commands)
 
 # === ОБРАБОТЧИКИ КОМАНД ===
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
     update_user_activity(user_id)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+    kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔄 Начать заново", callback_data="fake_start")]
     ])
     await message.answer(
         "✈️ Добро пожаловать в туристического помощника Drygin Travel!\n\n"
-        "Я помогу подобрать тур, расскажу о погоде или достопримечательностях.\n"
-        "Просто напиши, что ищешь – например, 'хочу тур в Турцию'.\n\n"
-        "Я общаюсь вежливо и без навязывания. /reset – очистить историю диалога.\n"
-        "/weather – погода, /time – текущее время.",
-        reply_markup=keyboard
+        "Я помогу подобрать тур, расскажу о погоде и достопримечательностях.\n"
+        "Просто задай вопрос в свободной форме.\n\n"
+        "Команды: /help – список команд, /reset – очистить память, /time – время, /weather <город>.",
+        reply_markup=kb
     )
 
 @dp.callback_query(lambda c: c.data == "fake_start")
-async def fake_start_callback(callback: types.CallbackQuery):
-    await callback.answer("Начинаем заново! Используйте /reset, чтобы очистить память.")
-    await callback.message.answer("Чтобы очистить историю диалога, напишите /reset.")
+async def fake_start_cb(callback: types.CallbackQuery):
+    await callback.answer("Начинаем заново! Используйте /reset для очистки истории.")
+    await callback.message.answer("Напишите /reset, чтобы очистить историю диалога.")
 
 @dp.message(Command("reset"))
 async def reset_cmd(message: types.Message):
-    user_id = message.from_user.id
-    clear_history(user_id)
-    await message.answer("🧹 История диалога очищена. Начинаем с чистого листа!")
+    clear_history(message.from_user.id)
+    await message.answer("🧹 История диалога очищена.")
 
 @dp.message(Command("stats"))
 async def stats_cmd(message: types.Message):
     if message.from_user.id != ADMIN_ID:
-        await message.answer("⛔️ Доступ запрещён. Эта команда только для администратора.")
+        await message.answer("⛔️ Доступ запрещён.")
         return
     users, msgs = get_stats()
     balance = await get_openrouter_balance()
-    balance_text = f"{balance:.2f} USD" if balance is not None else "не удалось получить"
-    await message.answer(
-        f"📊 Статистика бота:\n"
-        f"👤 Уникальных пользователей: {users}\n"
-        f"💬 Всего сообщений: {msgs}\n"
-        f"💰 Баланс OpenRouter: {balance_text}"
-    )
+    bal_text = f"{balance:.2f} USD" if balance else "не удалось"
+    await message.answer(f"📊 Статистика:\n👤 Пользователей: {users}\n💬 Сообщений: {msgs}\n💰 Баланс: {bal_text}")
 
 @dp.message(Command("time"))
 async def time_cmd(message: types.Message):
-    date_str, time_str, season = get_current_datetime_str()
-    await message.answer(
-        f"🕒 Текущее время: {time_str} (МСК)\n"
-        f"📅 Дата: {date_str}\n"
-        f"🍂 Сезон: {season}\n"
-        f"(время указано по московскому UTC+3)"
-    )
+    d, t, s = get_current_datetime_str()
+    await message.answer(f"🕒 {t} МСК\n📅 {d}\n🍂 {s}")
 
 @dp.message(Command("weather"))
 async def weather_cmd(message: types.Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("🌦️ Укажите местоположение. Пример: `/weather Москва`", parse_mode="Markdown")
+        await message.answer("🌦️ Укажите город: /weather Москва")
         return
-    location = parts[1].strip()
-    await message.answer(f"🔍 Ищу погоду в *{location}*...", parse_mode="Markdown")
-    weather_info = await get_weather(location)
-    await message.answer(weather_info, parse_mode="Markdown")
+    loc = parts[1].strip()
+    await message.answer(f"🔍 Ищу погоду в {loc}...")
+    info = await get_weather(loc)
+    await message.answer(info, parse_mode="Markdown")
 
 @dp.message(Command("help"))
 async def help_cmd(message: types.Message):
     await message.answer(
-        "Доступные команды:\n"
-        "/start – Главное меню\n"
-        "/help – Эта справка\n"
-        "/reset – Очистить историю диалога\n"
-        "/time – Текущее время и дата\n"
-        "/weather <место> – Погода сейчас\n\n"
-        "Примеры запросов:\n"
-        "– Хочу тур в Турцию на 7 ночей\n"
-        "– Подбери отель в Сочи у моря\n"
-        "– Какая погода в Риме?\n\n"
-        "Администратор: /stats"
+        "Команды:\n"
+        "/start – приветствие\n"
+        "/help – эта справка\n"
+        "/reset – очистить память диалога\n"
+        "/time – текущее время и дата\n"
+        "/weather <город> – погода\n"
+        "/stats – статистика (админ)\n\n"
+        "Просто напишите, что ищете: «Тур в Турцию на 7 ночей», «Отели в Стамбуле», «Погода в Сочи»."
     )
 
-# === ГЛАВНЫЙ ОБРАБОТЧИК (с новым промптом) ===
+# === ГЛАВНЫЙ ОБРАБОТЧИК С НОВЫМ ПРОМПТОМ И АВТОИСПРАВЛЕНИЕМ ===
 @dp.message()
 async def chat_handler(message: types.Message):
     user_id = message.from_user.id
@@ -307,26 +317,25 @@ async def chat_handler(message: types.Message):
     save_message(user_id, user_text)
     add_to_history(user_id, "user", user_text)
 
-    # Проверяем, является ли запрос погодным
-    weather_keywords = ['погод', 'температур', 'weather', 'прогноз', 'градус', 'на улице']
-    is_weather_query = any(kw in user_text.lower() for kw in weather_keywords)
-    
-    if is_weather_query:
-        location = extract_location_from_weather_query(user_text)
-        if location:
+    # Проверка на погоду
+    if any(kw in user_text.lower() for kw in ('погод', 'температур', 'weather')):
+        loc = extract_location_from_weather_query(user_text)
+        if loc:
             await bot.send_chat_action(message.chat.id, "typing")
-            weather_info = await get_weather(location)
+            weather_info = await get_weather(loc)
             await message.answer(weather_info, parse_mode="Markdown")
             add_to_history(user_id, "assistant", weather_info)
             return
         else:
-            await message.answer("🌍 Уточните, пожалуйста, местоположение. Например: *какая погода в Риме*", parse_mode="Markdown")
+            await message.answer("🌍 Уточните город, например: 'погода в Риме'")
             return
 
-    # ===== НОВЫЙ ПРОМПТ ДЛЯ ТУРИСТИЧЕСКОГО ПОМОЩНИКА (без агрессивных продаж) =====
+    # --- НОВЫЙ СИСТЕМНЫЙ ПРОМПТ (с требованием грамотности) ---
     date_str, time_str, season = get_current_datetime_str()
     system_prompt = (
         "Ты — добрый и ненавязчивый туристический помощник бота 'Drygin Travel'. "
+        "Твоя речь должна быть грамотной: пиши названия стран, городов, отелей и других имён собственных без ошибок. "
+        "Если сомневаешься в написании — используй самый распространённый вариант. Не выдумывай несуществующих слов.\n\n"
         "Твоя главная цель — помочь клиенту найти идеальный тур без давления. "
         "Относись к пользователю как к другу, который выбирает отпуск.\n\n"
         "Правила общения:\n"
@@ -350,8 +359,8 @@ async def chat_handler(message: types.Message):
         "Звёздность: {от 1 до 5 или 'не указана'}\n"
         "Питание: {тип или 'не указано'}\n"
         "Расположение: {пожелание или 'не указано'}\n\n"
-        "Всегда сохраняй искреннюю заботу и уважение. Не переходи к параметрам, если клиент явно не хочет обсуждать.\n\n"
-        f"Сегодня {date_str}, {time_str} по московскому времени, сезон: {season}."
+        "Всегда сохраняй искреннюю заботу и уважение. Не переходи к параметрам, если клиент явно не хочет обсуждать. "
+        "Пиши без орфографических ошибок, особенно названия городов (например, Стамбул, Москва, Анталья)."
     )
 
     context = get_history(user_id, 10)
@@ -369,18 +378,22 @@ async def chat_handler(message: types.Message):
             temperature=0.7,
         )
         answer = response.choices[0].message.content
+
+        # Исправляем типичные опечатки
+        answer = fix_typos(answer)
+
         add_to_history(user_id, "assistant", answer)
         await message.answer(answer)
 
-        # Если в ответе есть блок параметров, логируем его (для следующего шага – интеграция с API)
+        # Если в ответе есть блок параметров, логируем его (для будущей интеграции с API туров)
         if "=== ПАРАМЕТРЫ ПОИСКА ===" in answer:
             logger.info(f"Параметры поиска от {user_id}:\n{answer}")
-            # В будущем здесь будет вызов API туров
 
     except Exception as e:
         logger.error(f"OpenRouter error: {e}")
         await message.answer("⚠️ Ошибка при обращении к ИИ. Попробуйте позже.")
 
+# === ЗАПУСК ===
 async def main():
     await set_main_menu(bot)
     await dp.start_polling(bot)
