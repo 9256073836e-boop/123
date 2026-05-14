@@ -147,10 +147,19 @@ async def get_openrouter_balance():
             logger.error(f"Ошибка запроса баланса: {e}")
             return None
 
-# === ПОГОДА через Open-Meteo ===
-async def get_coordinates(city_name: str):
+# ========== ПОГОДА через Open-Meteo (геокодинг произвольных мест) ==========
+async def get_coordinates(location_query: str):
+    """
+    Получает широту и долготу для любого географического названия (город, регион, страна, район, аэропорт).
+    Использует Open-Meteo Geocoding API.
+    """
     url = "https://geocoding-api.open-meteo.com/v1/search"
-    params = {"name": city_name, "count": 1, "language": "ru", "format": "json"}
+    params = {
+        "name": location_query,
+        "count": 1,
+        "language": "ru",
+        "format": "json"
+    }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, params=params) as resp:
@@ -167,10 +176,8 @@ async def get_coordinates(city_name: str):
             logger.error(f"Ошибка геокодинга: {e}")
             return None, None
 
-async def get_weather(city: str) -> str:
-    lat, lon = await get_coordinates(city)
-    if lat is None or lon is None:
-        return f"❌ Не удалось найти город '{city}'. Проверьте название."
+async def get_weather_by_coords(lat: float, lon: float, location_name: str) -> str:
+    """Запрашивает текущую погоду по координатам через Open-Meteo Forecast API."""
     url = "https://api.open-meteo.com/v1/forecast"
     params = {
         "latitude": lat,
@@ -199,79 +206,65 @@ async def get_weather(city: str) -> str:
                         80: "🌦️ Ливень", 81: "🌦️ Ливень", 82: "🌦️ Ливень",
                     }
                     weather_desc = weather_map.get(weather_code, "🌥️ Облачно")
-                    return (f"🌍 Погода в городе *{city}*:\n"
+                    return (f"🌍 Погода в местоположении *{location_name}*:\n"
                             f"🌡️ Температура: *{temp}°C* (ощущается как {feels_like}°C)\n"
                             f"💧 Влажность: {humidity}%\n"
                             f"💨 Ветер: {wind_speed} м/с\n"
                             f"☁️ {weather_desc}")
                 else:
-                    return f"⚠️ Не удалось получить погоду для города '{city}'. Попробуйте позже."
+                    return f"⚠️ Не удалось получить погоду для '{location_name}'."
         except Exception as e:
-            logger.error(f"Open-Meteo error: {e}")
+            logger.error(f"Open-Meteo forecast error: {e}")
             return "⚠️ Ошибка при запросе погоды."
 
-# === УЛУЧШЕННАЯ ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ГОРОДА ===
-def extract_city_from_weather_query(text: str) -> str | None:
-    # Приводим к нижнему регистру
+async def get_weather(location_query: str) -> str:
+    """Главная функция получения погоды по произвольному текстовому запросу (геокодинг + погода)."""
+    lat, lon = await get_coordinates(location_query)
+    if lat is None or lon is None:
+        return f"❌ Не удалось найти местоположение '{location_query}'. Проверьте название."
+    return await get_weather_by_coords(lat, lon, location_query)
+
+# === ИЗВЛЕЧЕНИЕ МЕСТОПОЛОЖЕНИЯ ИЗ ЗАПРОСА О ПОГОДЕ (естественный язык) ===
+def extract_location_from_weather_query(text: str) -> str | None:
+    """
+    Извлекает название местоположения из сообщения о погоде.
+    Обрабатывает опечатки (например, 'москвпе' -> 'Москва').
+    """
     text_lower = text.lower()
-    # Сначала ищем прямые совпадения с известными городами (включая опечатки)
-    # Для простоты обработаем основные русские города
-    known_cities = {
-        "москва", "москве", "москву", "москвой", "москве", "москв",  # Москва и опечатки
-        "санкт-петербург", "спб", "питер", "петербург",
-        "сочи", "соче", "соча",
-        "казань", "казани",
-        "екатеринбург", "екб",
-        "новосибирск", "нижний новгород", "ростов", "ростов-на-дону",
-        "рим", "риме", "милан", "милане", "париж", "париже", "лондон", "лондоне",
-        "берлин", "берлине", "прага", "праге", "венеция", "венеции", "стамбул", "стамбуле",
-        "дубай", "дубае", "токио", "нью-йорк", "сидней", "сиднее", "барселона", "барселоне",
-        "мадрид", "мадриде", "амстердам", "амстердаме", "кёльн", "кёльне", "софия", "софии",
-        "хельсинки", "осло", "стокгольм", "стокгольме", "копенгаген", "копенгагене",
-        "брюссель", "брюсселе", "вена", "вене", "занзибар", "занзибаре"
+    
+    # Таблица распространённых опечаток и сокращений
+    typos = {
+        'москвпе': 'Москва', 'спб': 'Санкт-Петербург', 'питер': 'Санкт-Петербург',
+        'ростов': 'Ростов-на-Дону', 'нск': 'Новосибирск', 'ебург': 'Екатеринбург',
+        'нью-йорк': 'Нью-Йорк', 'вашингтон': 'Вашингтон', 'лондон': 'Лондон',
+        'париж': 'Париж', 'берлин': 'Берлин', 'рим': 'Рим', 'милан': 'Милан',
     }
-    # Проверяем, есть ли в тексте какой-либо из известных городов
-    for city in known_cities:
-        if city in text_lower:
-            # Возвращаем каноническое название (с заглавной буквы)
-            # Для простоты вернём как есть, но лучше привести к именительному падежу
-            # Ниже небольшой словарь для коррекции
-            correction = {
-                "москве": "Москва", "москву": "Москва", "москвой": "Москва", "москв": "Москва",
-                "спб": "Санкт-Петербург", "питер": "Санкт-Петербург", "петербург": "Санкт-Петербург",
-                "соче": "Сочи", "соча": "Сочи", "казани": "Казань",
-                "риме": "Рим", "милане": "Милан", "париже": "Париж", "лондоне": "Лондон",
-                "берлине": "Берлин", "праге": "Прага", "венеции": "Венеция", "стамбуле": "Стамбул",
-                "дубае": "Дубай", "сиднее": "Сидней", "барселоне": "Барселона", "мадриде": "Мадрид",
-                "амстердаме": "Амстердам", "кёльне": "Кёльн", "софии": "София", "стокгольме": "Стокгольм",
-                "копенгагене": "Копенгаген", "брюсселе": "Брюссель", "вене": "Вена", "занзибаре": "Занзибар"
-            }
-            if city in correction:
-                return correction[city]
-            return city.capitalize()
-    # Если не нашли по словарю, пробуем вытащить через регулярное выражение
+    for wrong, correct in typos.items():
+        if wrong in text_lower:
+            return correct
+    
+    # Паттерны для извлечения местоположения после ключевых слов
     patterns = [
-        r'погод[ауе]?\s+в\s+([а-яёa-z\-]+)',
-        r'температур[ауе]?\s+в\s+([а-яёa-z\-]+)',
-        r'weather\s+in\s+([a-z\-]+)',
-        r'прогноз\s+погод[ы]?\s+в\s+([а-яёa-z\-]+)',
-        r'сколько\s+градусов\s+в\s+([а-яёa-z\-]+)',
-        r'какая\s+погода\s+в\s+([а-яёa-z\-]+)',
-        r'что\s+с\s+погодой\s+в\s+([а-яёa-z\-]+)',
+        r'погод[ауе]?\s+в\s+(.+?)(?:[.!?]|$)',
+        r'температур[ауе]?\s+в\s+(.+?)(?:[.!?]|$)',
+        r'weather\s+in\s+(.+?)(?:[.!?]|$)',
+        r'прогноз\s+погод[ы]?\s+в\s+(.+?)(?:[.!?]|$)',
+        r'сколько\s+градусов\s+в\s+(.+?)(?:[.!?]|$)',
+        r'какая\s+погода\s+в\s+(.+?)(?:[.!?]|$)',
+        r'что\s+с\s+погодой\s+в\s+(.+?)(?:[.!?]|$)',
+        r'погод[ауе]?\s+(.+?)(?:[.!?]|$)',          # "погода Калифорния"
     ]
     for pattern in patterns:
         match = re.search(pattern, text_lower)
         if match:
-            city_raw = match.group(1).strip()
-            # Удаляем окончания для русских городов
-            if city_raw.endswith('е') or city_raw.endswith('у') or city_raw.endswith('ой') or city_raw.endswith('е'):
-                city_raw = city_raw[:-1]  # простая эвристика
-            return city_raw.capitalize()
+            location = match.group(1).strip()
+            if location:
+                return location.capitalize()
     return None
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ДАТЫ/ВРЕМЕНИ ===
 def get_current_datetime_str():
-    now = datetime.utcnow() + timedelta(hours=3)
+    now = datetime.utcnow() + timedelta(hours=3)  # МСК
     date_str = now.strftime("%d.%m.%Y")
     time_str = now.strftime("%H:%M")
     month = now.month
@@ -293,11 +286,11 @@ async def set_main_menu(bot: Bot):
         BotCommand(command="/reset", description="Очистить историю диалога"),
         BotCommand(command="/stats", description="Статистика бота (только админ)"),
         BotCommand(command="/time", description="Текущее время и дата"),
-        BotCommand(command="/weather", description="Погода в городе (например, /weather Москва)"),
+        BotCommand(command="/weather", description="Погода в месте (например, /weather Калифорния)"),
     ]
     await bot.set_my_commands(main_menu_commands)
 
-# === ОБРАБОТЧИКИ ===
+# === ОБРАБОТЧИКИ КОМАНД ===
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
@@ -312,7 +305,7 @@ async def start_cmd(message: types.Message):
         "У меня есть память о диалоге. /reset – очистить историю.\n"
         "Администратор может использовать /stats.\n"
         "Текущее время и дату можно узнать по команде /time.\n"
-        "Погоду в любом городе можно узнать по команде /weather или спросить в чате (например, 'какая погода в Москве').",
+        "Погоду в любом месте (город, регион, страна, район) можно узнать по команде /weather или спросить в чате, например 'какая погода в Калифорнии'.",
         reply_markup=keyboard
     )
 
@@ -356,11 +349,11 @@ async def time_cmd(message: types.Message):
 async def weather_cmd(message: types.Message):
     parts = message.text.split(maxsplit=1)
     if len(parts) < 2:
-        await message.answer("🌦️ Укажите город. Пример: `/weather Москва`", parse_mode="Markdown")
+        await message.answer("🌦️ Укажите местоположение. Пример: `/weather Калифорния` или `/weather Москва`", parse_mode="Markdown")
         return
-    city = parts[1].strip()
-    await message.answer(f"🔍 Ищу погоду в городе *{city}*...", parse_mode="Markdown")
-    weather_info = await get_weather(city)
+    location = parts[1].strip()
+    await message.answer(f"🔍 Ищу погоду в *{location}*...", parse_mode="Markdown")
+    weather_info = await get_weather(location)
     await message.answer(weather_info, parse_mode="Markdown")
 
 @dp.message(Command("help"))
@@ -371,15 +364,16 @@ async def help_cmd(message: types.Message):
         "/help – Эта справка\n"
         "/reset – Очистить историю диалога\n"
         "/time – Текущее время и дата\n"
-        "/weather <город> – Погода сейчас\n\n"
+        "/weather <место> – Погода сейчас (город, регион, страна, район и т.п.)\n\n"
         "Примеры запросов:\n"
-        "– Какая погода в Москве?\n"
+        "– Какая погода в Калифорнии?\n"
+        "– Температура в районе Лефортово\n"
         "– Посоветуй недорогой отель в Сочи у моря.\n"
         "– Что посмотреть в Питере за 3 дня?\n\n"
         "Администратор: /stats"
     )
 
-# === ГЛАВНЫЙ ОБРАБОТЧИК ===
+# === ГЛАВНЫЙ ОБРАБОТЧИК (естественные запросы) ===
 @dp.message()
 async def chat_handler(message: types.Message):
     user_id = message.from_user.id
@@ -394,15 +388,15 @@ async def chat_handler(message: types.Message):
     is_weather_query = any(kw in user_text.lower() for kw in weather_keywords)
     
     if is_weather_query:
-        city = extract_city_from_weather_query(user_text)
-        if city:
+        location = extract_location_from_weather_query(user_text)
+        if location:
             await bot.send_chat_action(message.chat.id, "typing")
-            weather_info = await get_weather(city)
+            weather_info = await get_weather(location)
             await message.answer(weather_info, parse_mode="Markdown")
             add_to_history(user_id, "assistant", weather_info)
             return
         else:
-            await message.answer("🌍 Уточните, пожалуйста, город. Например: *какая погода в Москве*", parse_mode="Markdown")
+            await message.answer("🌍 Уточните, пожалуйста, местоположение. Например: *какая погода в Калифорнии*", parse_mode="Markdown")
             return
 
     # Если не погода – обычный диалог с DeepSeek
