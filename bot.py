@@ -14,7 +14,6 @@ from openai import AsyncOpenAI
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 ADMIN_ID = int(os.getenv("ADMIN_ID", 0))
-OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "6189670b498e5b761b8ebeaf5e23d253")
 
 if not BOT_TOKEN or not OPENROUTER_API_KEY or not ADMIN_ID:
     raise ValueError("Не заданы BOT_TOKEN, OPENROUTER_API_KEY или ADMIN_ID")
@@ -148,45 +147,78 @@ async def get_openrouter_balance():
             logger.error(f"Ошибка запроса баланса: {e}")
             return None
 
-# === ПОГОДА ===
+# === ПОГОДА через Open-Meteo (без ключа, с геокодингом) ===
+async def get_coordinates(city_name: str):
+    """Получает широту и долготу по названию города через Open-Meteo Geocoding API"""
+    url = "https://geocoding-api.open-meteo.com/v1/search"
+    params = {"name": city_name, "count": 1, "language": "ru", "format": "json"}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("results"):
+                        result = data["results"][0]
+                        return result["latitude"], result["longitude"]
+                    else:
+                        return None, None
+                else:
+                    return None, None
+        except Exception as e:
+            logger.error(f"Ошибка геокодинга: {e}")
+            return None, None
+
 async def get_weather(city: str) -> str:
-    """Возвращает строку с погодой для заданного города через OpenWeatherMap"""
-    url = "https://api.openweathermap.org/data/2.5/weather"
+    """Возвращает строку с погодой для указанного города через Open-Meteo"""
+    lat, lon = await get_coordinates(city)
+    if lat is None or lon is None:
+        return f"❌ Не удалось найти город '{city}'. Проверьте название."
+
+    url = "https://api.open-meteo.com/v1/forecast"
     params = {
-        "q": city,
-        "appid": OPENWEATHER_API_KEY,
-        "units": "metric",
-        "lang": "ru"
+        "latitude": lat,
+        "longitude": lon,
+        "current": "temperature_2m,apparent_temperature,wind_speed_10m,relative_humidity_2m,weather_code",
+        "wind_speed_unit": "ms",
+        "timezone": "Europe/Moscow"
     }
     async with aiohttp.ClientSession() as session:
         try:
             async with session.get(url, params=params) as resp:
                 if resp.status == 200:
                     data = await resp.json()
-                    temp = data['main']['temp']
-                    feels_like = data['main']['feels_like']
-                    humidity = data['main']['humidity']
-                    wind = data['wind']['speed']
-                    desc = data['weather'][0]['description']
+                    current = data.get("current", {})
+                    temp = current.get("temperature_2m", "N/A")
+                    feels_like = current.get("apparent_temperature", "N/A")
+                    humidity = current.get("relative_humidity_2m", "N/A")
+                    wind_speed = current.get("wind_speed_10m", "N/A")
+                    weather_code = current.get("weather_code", 0)
+
+                    # Преобразование кода погоды в описание
+                    weather_map = {
+                        0: "☀️ Ясно", 1: "🌤️ В основном ясно", 2: "⛅ Переменная облачность",
+                        3: "☁️ Пасмурно", 45: "🌫️ Туман", 48: "🌫️ Туман (иней)",
+                        51: "🌦️ Морось", 53: "🌦️ Морось", 55: "🌦️ Морось",
+                        61: "🌧️ Дождь", 63: "🌧️ Дождь", 65: "🌧️ Дождь",
+                        71: "❄️ Снегопад", 73: "❄️ Снегопад", 75: "❄️ Снегопад",
+                        80: "🌦️ Ливень", 81: "🌦️ Ливень", 82: "🌦️ Ливень",
+                    }
+                    weather_desc = weather_map.get(weather_code, "🌥️ Облачно")
+
                     return (f"🌍 Погода в городе *{city}*:\n"
-                            f"🌡️ Температура: *{temp:.1f}°C* (ощущается как {feels_like:.1f}°C)\n"
+                            f"🌡️ Температура: *{temp}°C* (ощущается как {feels_like}°C)\n"
                             f"💧 Влажность: {humidity}%\n"
-                            f"💨 Ветер: {wind} м/с\n"
-                            f"☁️ {desc.capitalize()}")
-                elif resp.status == 404:
-                    return "❌ Город не найден. Проверьте название."
+                            f"💨 Ветер: {wind_speed} м/с\n"
+                            f"☁️ {weather_desc}")
                 else:
-                    return "⚠️ Сервис погоды временно недоступен."
+                    return f"⚠️ Не удалось получить погоду для города '{city}'. Попробуйте позже."
         except Exception as e:
-            logger.error(f"Погода ошибка: {e}")
+            logger.error(f"Open-Meteo error: {e}")
             return "⚠️ Ошибка при запросе погоды."
 
-# === ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ГОРОДА (улучшенная) ===
+# === ФУНКЦИЯ ИЗВЛЕЧЕНИЯ ГОРОДА ИЗ ЗАПРОСА ===
 def extract_city_from_weather_query(text: str) -> str | None:
-    """
-    Извлекает название города из запроса о погоде.
-    Приводит падежную форму к именительному падежу.
-    """
+    """Извлекает название города из запроса о погоде (упрощённая версия)"""
     text_lower = text.lower()
     patterns = [
         r'погод[ауе]?\s+в\s+([а-яёa-z\-]+)',
@@ -196,52 +228,13 @@ def extract_city_from_weather_query(text: str) -> str | None:
         r'сколько\s+градусов\s+в\s+([а-яёa-z\-]+)',
         r'какая\s+погода\s+в\s+([а-яёa-z\-]+)',
         r'что\s+с\s+погодой\s+в\s+([а-яёa-z\-]+)',
-        r'погод[ауе]?\s+([а-яёa-z\-]+)',
     ]
-    city_raw = None
     for pattern in patterns:
         match = re.search(pattern, text_lower)
         if match:
-            city_raw = match.group(1).strip()
-            break
-    if not city_raw:
-        return None
-
-    # Словарь для приведения к именительному падежу (основные туристические города)
-    cases = {
-        'риме': 'Рим', 'милане': 'Милан', 'париже': 'Париж', 'лондоне': 'Лондон',
-        'берлине': 'Берлин', 'праге': 'Прага', 'венеции': 'Венеция', 'рим': 'Рим',
-        'милан': 'Милан', 'париж': 'Париж', 'лондон': 'Лондон', 'берлин': 'Берлин',
-        'прага': 'Прага', 'венеция': 'Венеция', 'атине': 'Афины', 'афины': 'Афины',
-        'стамбуле': 'Стамбул', 'стамбул': 'Стамбул', 'дубае': 'Дубай', 'дубай': 'Дубай',
-        'токио': 'Токио', 'нью-йорке': 'Нью-Йорк', 'нью-йорк': 'Нью-Йорк',
-        'сиднее': 'Сидней', 'сидней': 'Сидней', 'барселоне': 'Барселона',
-        'барселона': 'Барселона', 'мадриде': 'Мадрид', 'мадрид': 'Мадрид',
-        'амстердаме': 'Амстердам', 'амстердам': 'Амстердам', 'кёльне': 'Кёльн',
-        'кёльн': 'Кёльн', 'софии': 'София', 'софия': 'София', 'хельсинки': 'Хельсинки',
-        'осло': 'Осло', 'стокгольме': 'Стокгольм', 'стокгольм': 'Стокгольм',
-        'копенгагене': 'Копенгаген', 'копенгаген': 'Копенгаген', 'брюсселе': 'Брюссель',
-        'брюссель': 'Брюссель', 'вене': 'Вена', 'вена': 'Вена', 'занзибаре': 'Занзибар',
-        'занзибар': 'Занзибар', 'мос': 'Москва', 'москва': 'Москва',
-        'питере': 'Санкт-Петербург', 'санкт-петербург': 'Санкт-Петербург',
-        'сочи': 'Сочи', 'казани': 'Казань', 'казань': 'Казань',
-    }
-    normalized = cases.get(city_raw)
-    if normalized:
-        return normalized
-
-    # Эвристика для русских городов
-    if city_raw.endswith('е'):
-        return city_raw[:-1].capitalize()
-    elif city_raw.endswith('ы'):
-        return (city_raw[:-1] + 'а').capitalize()
-    elif city_raw.endswith('и'):
-        return (city_raw[:-1] + 'ы').capitalize()
-    elif city_raw.endswith('у'):
-        return city_raw[:-1].capitalize()
-    elif city_raw.endswith('ю'):
-        return city_raw[:-1] + 'я'
-    return city_raw.capitalize()
+            city = match.group(1).strip()
+            return city.capitalize()
+    return None
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ ДАТЫ/ВРЕМЕНИ ===
 def get_current_datetime_str():
@@ -271,7 +264,7 @@ async def set_main_menu(bot: Bot):
     ]
     await bot.set_my_commands(main_menu_commands)
 
-# === ОСНОВНЫЕ ОБРАБОТЧИКИ ===
+# === ОБРАБОТЧИКИ ===
 @dp.message(Command("start"))
 async def start_cmd(message: types.Message):
     user_id = message.from_user.id
@@ -286,7 +279,7 @@ async def start_cmd(message: types.Message):
         "У меня есть память о диалоге. /reset – очистить историю.\n"
         "Администратор может использовать /stats.\n"
         "Текущее время и дату можно узнать по команде /time.\n"
-        "Погоду в любом городе можно узнать по команде /weather или спросить в чате.",
+        "Погоду в любом городе можно узнать по команде /weather или спросить в чате (например, 'какая погода в Риме').",
         reply_markup=keyboard
     )
 
@@ -359,7 +352,6 @@ async def chat_handler(message: types.Message):
     user_id = message.from_user.id
     user_text = message.text
 
-    # Обновляем статистику
     update_user_activity(user_id)
     save_message(user_id, user_text)
     add_to_history(user_id, "user", user_text)
